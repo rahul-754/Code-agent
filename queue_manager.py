@@ -19,6 +19,7 @@ async def push_to_queue():
     source = db[SOURCE_COLLECTION]
     scraped = db[SCRAPED_COLLECTION]
     scraped_ids = set(scraped.distinct("Record_id"))
+    queued_ids = set(redis_client.smembers("scraping_queue_ids"))  # Redis set for queued Record_ids
     blocked_domains = [
         "quickerala.com","patakare.com","lazoi.com","sehat.com","lybrate.com",
         "ihindustan.com","justdialdds.com","prescripson.com","practo.com",
@@ -34,18 +35,26 @@ async def push_to_queue():
         "url": {"$ne": None, "$not": {"$regex": regex_pattern}}
     }, {"_id": 0, "Record_id": 1, "url": 1}).limit(50000)
     batch = []
+    batch_ids = []
     total_pushed = 0
     for record in cursor:
+        rid = str(record["Record_id"])
+        if rid in scraped_ids or rid.encode() in queued_ids:
+            continue  # Skip if already scraped or already queued
         batch.append(json.dumps({
             "Record_id": record["Record_id"],
             "url": record["url"]
         }))
+        batch_ids.append(rid)
         if len(batch) >= QUEUE_BATCH_SIZE:
             redis_client.lpush("scraping_queue", *batch)
+            redis_client.sadd("scraping_queue_ids", *batch_ids)
             total_pushed += len(batch)
             batch = []
+            batch_ids = []
     if batch:
         redis_client.lpush("scraping_queue", *batch)
+        redis_client.sadd("scraping_queue_ids", *batch_ids)
         total_pushed += len(batch)
     print(f"Total queued: {total_pushed}")
     mongo_client.close()

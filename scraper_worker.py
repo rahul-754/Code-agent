@@ -21,7 +21,7 @@ CHROMIUM_EXECUTABLE_PATH = r"C:\Users\Desk0012\AppData\Local\ms-playwright\chrom
 CONCURRENCY = 50
 HTTP_TIMEOUT = 15
 BROWSER_TIMEOUT = 45000  # ms
-BATCH_INSERT_SIZE = 1  # Increased batch size for efficiency
+BATCH_INSERT_SIZE = 50  # Increased batch size for efficiency
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
@@ -327,25 +327,19 @@ RULES:
     return None, "", 500
 
 
-async def process_single_url(session, browser, record):
-    """
-    Process a single URL:
-    - Check DB if already processed
-    - Fetch visible text (prefer browser fetch, fallback to static fetch)
-    - Extract info with LLM
-    - Return structured result for DB insert
-    """
-    record_id = record.get("Record_id")
+async def process_single_url(session, browser, record, mongo_client, redis_client):
+    record_id = str(record.get("Record_id"))
     url = record.get("url")
 
-    client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
+    db = mongo_client[DB_NAME]
     output_collection = db[OUTPUT_COLLECTION]
-    # Skip if already processed
-    if output_collection.find_one({"Record_id": record_id}):
-        client.close()
+
+    # Double-check: skip if already processed or in progress
+    if output_collection.find_one({"Record_id": record_id}) or redis_client.sismember("scraping_in_progress", record_id):
         return None
-    client.close()
+
+    # Mark as in progress
+    redis_client.sadd("scraping_in_progress", record_id)
 
     # Fetch content with browser context reuse
     text_content, method = await fetch_with_browser(browser, url)
@@ -357,7 +351,7 @@ async def process_single_url(session, browser, record):
         return None
 
     structured_data, raw_response, status_code = extract_with_llm(text_content, record_id, url)
-    return {
+    result = {
         "source_url": url,
         "structured_data": structured_data,
         "raw_response": raw_response,
@@ -368,25 +362,26 @@ async def process_single_url(session, browser, record):
         "worker_id": WORKER_ID
     }
 
+    # Remove from in progress, add to completed
+    redis_client.srem("scraping_in_progress", record_id)
+    redis_client.sadd("scraping_queue_ids", record_id)
+    return result
 
-async def batch_insert_to_mongo(documents):
+async def batch_insert_to_mongo(documents, mongo_client):
     if not documents:
         return
-    client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
+    db = mongo_client[DB_NAME]
     output_collection = db[OUTPUT_COLLECTION]
     try:
         output_collection.insert_many(documents, ordered=False)
         logger.info(f"Inserted {len(documents)} documents to MongoDB collection '{OUTPUT_COLLECTION}'")
     except Exception as e:
         logger.error(f"Batch insert failed: {e}")
-    finally:
-        client.close()
-
 
 async def worker():
     logger.info(f"Worker starting; REDIS={REDIS_URL} / MONGO={MONGO_URI}")
     redis_client = redis.Redis.from_url(REDIS_URL)
+    mongo_client = MongoClient(MONGO_URI)  # Reuse client for all operations
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
@@ -413,19 +408,19 @@ async def worker():
             async with semaphore:
                 processed_count += 1
                 logger.info(f"Processing URL #{processed_count}: {record.get('url')}")
-                return await process_single_url(session, browser, record)
+                return await process_single_url(session, browser, record, mongo_client, redis_client)
 
         while True:
             tasks = []
-            for _ in range(min(CONCURRENCY, 10)):
+            for _ in range(CONCURRENCY):  # Use full concurrency
                 data = redis_client.brpop("scraping_queue", timeout=5)
                 if data:
                     record = json.loads(data[1])
                     task = asyncio.create_task(process_with_semaphore(record))
                     tasks.append(task)
             if not tasks:
-                logger.info("No queue tasks, sleeping 10s...")
-                await asyncio.sleep(10)
+                logger.info("No queue tasks, sleeping 2s...")
+                await asyncio.sleep(2)
                 continue
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -435,13 +430,12 @@ async def worker():
                     pending_documents.append(r)
 
             if len(pending_documents) >= BATCH_INSERT_SIZE:
-                await batch_insert_to_mongo(pending_documents)
+                await batch_insert_to_mongo(pending_documents, mongo_client)
                 pending_documents = []
 
     await browser.close()
     await playwright.stop()
-
-
+    mongo_client.close()
 
 
 if __name__ == "__main__":

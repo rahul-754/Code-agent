@@ -5,3 +5,38 @@ pymongo
 requests
 pandas
 bs4
+
+# Ensure Playwright browsers are installed after package install
+# Add this as a post-install step using pip's "playwright install" command
+# You can use a requirements.txt with a pip "extra" like below:
+
+# Install all Python packages
+# Then install Playwright browsers automatically
+# This works with pip >= 22.0
+
+[options]
+install_requires =
+    playwright==1.44.0
+    aiohttp
+    redis
+    pymongo
+    requests
+    pandas
+    bs4
+
+[options.entry_points]
+console_scripts =
+    playwright-install = playwright.__main__:main
+
+# Or, for a simple solution, add a setup script:
+# After pip install -r requirements.txt, run:
+# python -m playwright install
+
+# For full automation, create a setup.bat file:
+# setup.bat
+# -----------------
+# pip install -r requirements.txt
+# python -m playwright install
+# -----------------
+
+# Now, on each worker, just run setup.bat once, then run your scraper_worker.py
